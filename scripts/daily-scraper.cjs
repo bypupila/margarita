@@ -2,12 +2,11 @@
  * Daily Scraper Script for Margarita Properties
  * Runs via GitHub Actions every day at 6:00 AM
  * 
- * What it does:
- * 1. Calls Apify to scrape Instagram for property posts
- * 2. Filters valid properties (price, location, etc.)
- * 3. Validates images with Gemini Vision (optional)
- * 4. Geocodes addresses with OpenStreetMap
- * 5. Saves results to public/data/scraped_properties.json
+ * DATA SOURCES (in priority order):
+ * 1. CSV files in public/data/pending/ folder (FREE - manual upload)
+ * 2. Apify Instagram scraper (when credits available)
+ * 
+ * Output: public/data/scraped_properties.json
  */
 
 const fs = require('fs');
@@ -17,20 +16,22 @@ const path = require('path');
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN || '';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
-// Check if running in CI
+// Paths
+const PENDING_FOLDER = path.join(__dirname, '../public/data/pending');
+const OUTPUT_FILE = path.join(__dirname, '../public/data/scraped_properties.json');
+const PROCESSED_FOLDER = path.join(__dirname, '../public/data/processed');
+
+// Check environment
 const isCI = process.env.CI === 'true';
 console.log(`Environment: ${isCI ? 'GitHub Actions' : 'Local'}`);
-console.log(`APIFY_API_TOKEN: ${APIFY_API_TOKEN ? '✅ Set' : '❌ Not set'}`);
-console.log(`GEMINI_API_KEY: ${GEMINI_API_KEY ? '✅ Set' : '❌ Not set'}`);
+console.log(`APIFY_API_TOKEN: ${APIFY_API_TOKEN ? '✅ Set' : '❌ Not set (will use CSV files only)'}`);
 
-// Instagram hashtags to search
+// Instagram hashtags to search (only used if Apify is available)
 const HASHTAGS = [
     'ventamargarita',
-    'inmoblesmargarita',
     'inmueblesmargarita',
     'apartamentomargarita',
-    'casamargarita',
-    'propiedadmargarita'
+    'casamargarita'
 ];
 
 // Known zones in Margarita with coordinates [lat, lng]
@@ -52,41 +53,31 @@ const MARGARITA_ZONES = {
     'manzanillo': { name: 'Manzanillo', lat: 11.1575, lng: -63.8920 },
 };
 
-// Margarita bounds for validation
 const MARGARITA_BOUNDS = {
     minLat: 10.85, maxLat: 11.20,
     minLng: -64.05, maxLng: -63.70
 };
 
-/**
- * Normalize text (remove accents)
- */
+// ============= UTILITY FUNCTIONS =============
+
 function normalize(str) {
     return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
 
-/**
- * Check if coordinates are within Margarita
- */
 function isWithinMargarita(lat, lng) {
     return lat >= MARGARITA_BOUNDS.minLat && lat <= MARGARITA_BOUNDS.maxLat &&
         lng >= MARGARITA_BOUNDS.minLng && lng <= MARGARITA_BOUNDS.maxLng;
 }
 
-/**
- * Extract property data from caption text
- */
 function extractPropertyData(caption) {
     const normalized = normalize(caption);
 
-    // Check if it's a sale (not rental)
     const isSale = normalized.includes('venta') || normalized.includes('vendo') ||
-        normalized.includes('precio') || /\$\s*\d/.test(caption);
+        normalized.includes('precio') || normalized.includes('oportunidad') || /\$\s*\d/.test(caption);
     const isRental = normalized.includes('alquiler') || normalized.includes('renta');
 
     if (!isSale || isRental) return null;
 
-    // Check for property keywords
     const propertyKeywords = ['casa', 'apartamento', 'apto', 'terreno', 'local',
         'quinta', 'townhouse', 'penthouse', 'habitacion'];
     const isProperty = propertyKeywords.some(kw => normalized.includes(kw));
@@ -129,12 +120,11 @@ function extractPropertyData(caption) {
     }
 
     if (!zone) {
-        // Default to center of Margarita
         zone = 'Isla de Margarita';
         coordinates = { lat: 11.0000, lng: -63.9000 };
     }
 
-    // Extract property type
+    // Extract type
     let type = 'CASA';
     if (normalized.includes('apartamento') || normalized.includes('apto') || normalized.includes('penthouse')) {
         type = 'APARTAMENTO';
@@ -144,12 +134,11 @@ function extractPropertyData(caption) {
         type = 'LOCAL_COMERCIAL';
     }
 
-    // Extract bedrooms
+    // Extract details
     let bedrooms = null;
     const bedroomMatch = caption.match(/(\d+)\s*(hab|habitacion|dormitorio|cuarto)/i);
     if (bedroomMatch) bedrooms = parseInt(bedroomMatch[1]);
 
-    // Extract bathrooms
     let bathrooms = null;
     const bathroomMatch = caption.match(/(\d+)\s*(baño|bath)/i);
     if (bathroomMatch) bathrooms = parseInt(bathroomMatch[1]);
@@ -165,21 +154,161 @@ function extractPropertyData(caption) {
     };
 }
 
-/**
- * Scrape Instagram using Apify
- */
-async function scrapeInstagram() {
-    if (!APIFY_API_TOKEN) {
-        console.error('❌ APIFY_API_TOKEN not set');
+// ============= SOURCE 1: CSV FILES (FREE) =============
+
+function parseCSV(content) {
+    const lines = content.split('\n').filter(line => line.trim());
+    if (lines.length < 2) return [];
+
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/"/g, ''));
+    const rows = [];
+
+    for (let i = 1; i < lines.length; i++) {
+        // Simple CSV parsing (handles quoted values)
+        const values = [];
+        let current = '';
+        let inQuotes = false;
+
+        for (const char of lines[i]) {
+            if (char === '"') {
+                inQuotes = !inQuotes;
+            } else if (char === ',' && !inQuotes) {
+                values.push(current.trim());
+                current = '';
+            } else {
+                current += char;
+            }
+        }
+        values.push(current.trim());
+
+        const row = {};
+        headers.forEach((header, index) => {
+            row[header] = values[index] || '';
+        });
+        rows.push(row);
+    }
+
+    return rows;
+}
+
+function loadCSVFiles() {
+    console.log('📂 Looking for CSV files in pending folder...');
+
+    // Create folders if they don't exist
+    if (!fs.existsSync(PENDING_FOLDER)) {
+        fs.mkdirSync(PENDING_FOLDER, { recursive: true });
+        console.log('   Created pending folder: ' + PENDING_FOLDER);
+    }
+    if (!fs.existsSync(PROCESSED_FOLDER)) {
+        fs.mkdirSync(PROCESSED_FOLDER, { recursive: true });
+    }
+
+    const files = fs.readdirSync(PENDING_FOLDER).filter(f => f.endsWith('.csv'));
+
+    if (files.length === 0) {
+        console.log('   No CSV files found in pending folder');
         return [];
     }
 
-    console.log('🔍 Starting Instagram scrape...');
+    console.log(`   Found ${files.length} CSV file(s)`);
 
+    const allRows = [];
+
+    for (const file of files) {
+        const filePath = path.join(PENDING_FOLDER, file);
+        console.log(`   Processing: ${file}`);
+
+        try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            const rows = parseCSV(content);
+
+            // Add source info
+            rows.forEach(row => {
+                row._sourceFile = file;
+            });
+
+            allRows.push(...rows);
+            console.log(`   ✅ ${rows.length} rows from ${file}`);
+
+            // Move to processed folder
+            const processedPath = path.join(PROCESSED_FOLDER, `${Date.now()}_${file}`);
+            fs.renameSync(filePath, processedPath);
+            console.log(`   📦 Moved to processed folder`);
+
+        } catch (error) {
+            console.error(`   ❌ Error reading ${file}:`, error.message);
+        }
+    }
+
+    return allRows;
+}
+
+function processCSVRows(rows) {
+    console.log('🔄 Processing CSV data...');
+    const properties = [];
+
+    for (const row of rows) {
+        const description = row.description || row.descripcion || row.caption || '';
+        if (description.length < 20) continue;
+
+        const extracted = extractPropertyData(description);
+        if (!extracted) {
+            console.log(`   ⚠️ Skipped: No valid data in "${description.slice(0, 40)}..."`);
+            continue;
+        }
+
+        const property = {
+            id: `csv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            title: extracted.title,
+            type: extracted.type,
+            price: extracted.price,
+            bedrooms: extracted.bedrooms,
+            bathrooms: extracted.bathrooms,
+            zone: extracted.zone,
+            address: extracted.zone,
+            description: description,
+            latitude: extracted.coordinates.lat,
+            longitude: extracted.coordinates.lng,
+            coordinates: extracted.coordinates,
+            instagramUrl: row.url || row.instagram_url || row.link || '',
+            instagramId: '',
+            thumbnailUrl: row.image_url || row.imagen || row.thumbnail || '',
+            mediaUrls: [row.image_url || row.imagen || ''].filter(Boolean),
+            ownerHandle: row.owner || row.vendedor || row.account || '',
+            postedAt: new Date().toISOString(),
+            status: 'available',
+            approvalStatus: 'pending',
+            isActive: true,
+            qualityScore: 70,
+            aiConfidence: 0.7,
+            hasPhotos: !!(row.image_url || row.imagen),
+            hasPrice: true,
+            hasLocation: true,
+            updatedAt: new Date().toISOString(),
+            scrapedAt: new Date().toISOString(),
+            source: 'csv'
+        };
+
+        properties.push(property);
+    }
+
+    console.log(`   ✅ ${properties.length} valid properties from CSV`);
+    return properties;
+}
+
+// ============= SOURCE 2: APIFY (OPTIONAL) =============
+
+async function scrapeInstagram() {
+    if (!APIFY_API_TOKEN) {
+        console.log('ℹ️ Apify not configured - skipping Instagram scrape');
+        return [];
+    }
+
+    console.log('🔍 Starting Instagram scrape with Apify...');
     const posts = [];
 
-    for (const hashtag of HASHTAGS) {
-        console.log(`  Searching #${hashtag}...`);
+    for (const hashtag of HASHTAGS.slice(0, 2)) { // Limit hashtags to save credits
+        console.log(`   Searching #${hashtag}...`);
 
         try {
             const response = await fetch('https://api.apify.com/v2/acts/apify~instagram-hashtag-scraper/run-sync-get-dataset-items', {
@@ -190,42 +319,35 @@ async function scrapeInstagram() {
                 },
                 body: JSON.stringify({
                     hashtags: [hashtag],
-                    resultsLimit: 20  // Limit to stay within free tier
+                    resultsLimit: 10  // Minimal to save credits
                 })
             });
 
             if (!response.ok) {
-                console.log(`  ⚠️ Failed for #${hashtag}: ${response.status}`);
+                console.log(`   ⚠️ Failed: ${response.status}`);
                 continue;
             }
 
             const data = await response.json();
             posts.push(...data);
-            console.log(`  ✅ Found ${data.length} posts for #${hashtag}`);
+            console.log(`   ✅ Found ${data.length} posts`);
 
-            // Rate limit - wait 2 seconds between requests
             await new Promise(r => setTimeout(r, 2000));
 
         } catch (error) {
-            console.error(`  ❌ Error for #${hashtag}:`, error.message);
+            console.error(`   ❌ Error:`, error.message);
         }
     }
 
-    console.log(`📊 Total posts scraped: ${posts.length}`);
     return posts;
 }
 
-/**
- * Process scraped posts into property objects
- */
-function processPosts(posts) {
-    console.log('🔄 Processing posts...');
-
+function processApifyPosts(posts) {
+    console.log('🔄 Processing Apify data...');
     const properties = [];
     const seenUrls = new Set();
 
     for (const post of posts) {
-        // Skip duplicates
         if (seenUrls.has(post.url)) continue;
         seenUrls.add(post.url);
 
@@ -235,13 +357,10 @@ function processPosts(posts) {
         const extracted = extractPropertyData(caption);
         if (!extracted) continue;
 
-        // Validate coordinates
-        if (!isWithinMargarita(extracted.coordinates.lat, extracted.coordinates.lng)) {
-            continue;
-        }
+        if (!isWithinMargarita(extracted.coordinates.lat, extracted.coordinates.lng)) continue;
 
         const property = {
-            id: `scraped-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            id: `apify-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             title: extracted.title,
             type: extracted.type,
             price: extracted.price,
@@ -260,7 +379,7 @@ function processPosts(posts) {
             ownerHandle: post.ownerUsername ? `@${post.ownerUsername}` : '',
             postedAt: post.timestamp || new Date().toISOString(),
             status: 'available',
-            approvalStatus: 'pending',  // All scraped properties start as pending
+            approvalStatus: 'pending',
             isActive: true,
             qualityScore: 70,
             aiConfidence: 0.7,
@@ -268,49 +387,23 @@ function processPosts(posts) {
             hasPrice: true,
             hasLocation: true,
             updatedAt: new Date().toISOString(),
-            scrapedAt: new Date().toISOString()
+            scrapedAt: new Date().toISOString(),
+            source: 'apify'
         };
 
         properties.push(property);
     }
 
-    console.log(`✅ Processed ${properties.length} valid properties`);
+    console.log(`   ✅ ${properties.length} valid properties from Apify`);
     return properties;
 }
 
-/**
- * Geocode using OpenStreetMap Nominatim (free)
- */
-async function geocodeWithNominatim(zone) {
-    try {
-        const query = encodeURIComponent(`${zone}, Isla de Margarita, Venezuela`);
-        const response = await fetch(
-            `https://nominatim.openstreetmap.org/search?q=${query}&format=json&limit=1`,
-            { headers: { 'User-Agent': 'MargaritaPropertiesScraper/1.0' } }
-        );
+// ============= MAIN =============
 
-        const data = await response.json();
-        if (data.length > 0) {
-            const lat = parseFloat(data[0].lat);
-            const lon = parseFloat(data[0].lon);
-            if (isWithinMargarita(lat, lon)) {
-                return { lat, lng: lon };
-            }
-        }
-    } catch (error) {
-        console.error('Geocoding error:', error.message);
-    }
-    return null;
-}
-
-/**
- * Load existing properties from JSON file
- */
 function loadExistingProperties() {
-    const filePath = path.join(__dirname, '../public/data/scraped_properties.json');
     try {
-        if (fs.existsSync(filePath)) {
-            const data = fs.readFileSync(filePath, 'utf8');
+        if (fs.existsSync(OUTPUT_FILE)) {
+            const data = fs.readFileSync(OUTPUT_FILE, 'utf8');
             return JSON.parse(data);
         }
     } catch (error) {
@@ -319,65 +412,86 @@ function loadExistingProperties() {
     return [];
 }
 
-/**
- * Save properties to JSON file
- */
 function saveProperties(properties) {
-    const dataDir = path.join(__dirname, '../public/data');
+    const dataDir = path.dirname(OUTPUT_FILE);
     if (!fs.existsSync(dataDir)) {
         fs.mkdirSync(dataDir, { recursive: true });
     }
-
-    const filePath = path.join(dataDir, 'scraped_properties.json');
-    fs.writeFileSync(filePath, JSON.stringify(properties, null, 2), 'utf8');
-    console.log(`💾 Saved ${properties.length} properties to ${filePath}`);
+    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(properties, null, 2), 'utf8');
+    console.log(`💾 Saved ${properties.length} properties`);
 }
 
-/**
- * Main function
- */
 async function main() {
-    console.log('🚀 Starting daily property scraper...');
-    console.log(`📅 Date: ${new Date().toISOString()}`);
+    console.log('');
+    console.log('🚀 ========================================');
+    console.log('   MARGARITA PROPERTIES - DAILY SCRAPER');
+    console.log('   ' + new Date().toISOString());
+    console.log('==========================================');
     console.log('');
 
-    // Load existing properties
+    // Load existing
     const existingProperties = loadExistingProperties();
-    const existingUrls = new Set(existingProperties.map(p => p.instagramUrl));
-    console.log(`📚 Loaded ${existingProperties.length} existing properties`);
+    const existingIds = new Set(existingProperties.map(p => p.instagramUrl || p.id));
+    console.log(`📚 Existing properties: ${existingProperties.length}`);
+    console.log('');
 
-    // Scrape new posts
-    const posts = await scrapeInstagram();
+    let newProperties = [];
 
-    // Process posts
-    const newProperties = processPosts(posts);
+    // SOURCE 1: CSV files (FREE - always check first)
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('📋 SOURCE 1: CSV FILES (FREE)');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    const csvRows = loadCSVFiles();
+    if (csvRows.length > 0) {
+        const csvProperties = processCSVRows(csvRows);
+        newProperties.push(...csvProperties);
+    }
+    console.log('');
 
-    // Filter out duplicates
-    const uniqueNewProperties = newProperties.filter(p => !existingUrls.has(p.instagramUrl));
-    console.log(`🆕 ${uniqueNewProperties.length} new unique properties`);
+    // SOURCE 2: Apify (only if token available)
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('📱 SOURCE 2: APIFY INSTAGRAM (OPTIONAL)');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    const apifyPosts = await scrapeInstagram();
+    if (apifyPosts.length > 0) {
+        const apifyProperties = processApifyPosts(apifyPosts);
+        newProperties.push(...apifyProperties);
+    }
+    console.log('');
 
-    // Merge with existing
-    const allProperties = [...existingProperties, ...uniqueNewProperties];
+    // Filter duplicates
+    const uniqueNew = newProperties.filter(p => {
+        const key = p.instagramUrl || p.id;
+        return !existingIds.has(key);
+    });
 
-    // Save (even if empty, to ensure file exists)
+    // Merge
+    const allProperties = [...existingProperties, ...uniqueNew];
+
+    // Save
     saveProperties(allProperties);
 
+    // Summary
     console.log('');
-    console.log('✅ Daily scrape completed!');
-    console.log(`   Total properties: ${allProperties.length}`);
-    console.log(`   New properties: ${uniqueNewProperties.length}`);
+    console.log('✅ ========================================');
+    console.log('   SCRAPE COMPLETED!');
+    console.log('==========================================');
+    console.log(`   📊 Total properties: ${allProperties.length}`);
+    console.log(`   🆕 New this run: ${uniqueNew.length}`);
+    console.log(`      - From CSV: ${uniqueNew.filter(p => p.source === 'csv').length}`);
+    console.log(`      - From Apify: ${uniqueNew.filter(p => p.source === 'apify').length}`);
+    console.log('');
 
     return true;
 }
 
-// Run with proper error handling
+// Run
 main()
-    .then((success) => {
+    .then(() => {
         console.log('Script finished successfully');
         process.exit(0);
     })
     .catch((error) => {
-        console.error('Script failed with error:', error);
+        console.error('Script failed:', error);
         process.exit(1);
     });
-
