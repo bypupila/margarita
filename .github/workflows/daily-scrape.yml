@@ -1,0 +1,59 @@
+name: Daily Property Scraper
+
+# Runs every day at 6:00 AM Venezuela time (10:00 UTC)
+on:
+  schedule:
+    - cron: '0 10 * * *'  # 10:00 UTC = 6:00 AM Venezuela
+  
+  # Also allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Create data directory
+        run: mkdir -p public/data
+      
+      - name: Run scraper
+        env:
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node scripts/daily-scraper.js
+      
+      - name: Check for changes
+        id: git-check
+        run: |
+          git diff --quiet public/data/ || echo "changes=true" >> $GITHUB_OUTPUT
+      
+      - name: Commit and push changes
+        if: steps.git-check.outputs.changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add public/data/
+          git commit -m "🏠 Daily scrape: $(date +'%Y-%m-%d %H:%M')"
+          git push
+      
+      - name: Summary
+        run: |
+          echo "## 📊 Scrape Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f public/data/scraped_properties.json ]; then
+            TOTAL=$(cat public/data/scraped_properties.json | jq length)
+            echo "- **Total properties:** $TOTAL" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- No properties file found" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **Run time:** $(date)" >> $GITHUB_STEP_SUMMARY
