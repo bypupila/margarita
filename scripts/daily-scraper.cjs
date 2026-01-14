@@ -7,15 +7,21 @@
  * 2. Filters valid properties (price, location, etc.)
  * 3. Validates images with Gemini Vision (optional)
  * 4. Geocodes addresses with OpenStreetMap
- * 5. Saves results to data/scraped_properties.json
+ * 5. Saves results to public/data/scraped_properties.json
  */
 
 const fs = require('fs');
 const path = require('path');
 
 // Configuration from environment variables (set in GitHub Secrets)
-const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+
+// Check if running in CI
+const isCI = process.env.CI === 'true';
+console.log(`Environment: ${isCI ? 'GitHub Actions' : 'Local'}`);
+console.log(`APIFY_API_TOKEN: ${APIFY_API_TOKEN ? '✅ Set' : '❌ Not set'}`);
+console.log(`GEMINI_API_KEY: ${GEMINI_API_KEY ? '✅ Set' : '❌ Not set'}`);
 
 // Instagram hashtags to search
 const HASHTAGS = [
@@ -353,14 +359,25 @@ async function main() {
     // Merge with existing
     const allProperties = [...existingProperties, ...uniqueNewProperties];
 
-    // Save
+    // Save (even if empty, to ensure file exists)
     saveProperties(allProperties);
 
     console.log('');
     console.log('✅ Daily scrape completed!');
     console.log(`   Total properties: ${allProperties.length}`);
     console.log(`   New properties: ${uniqueNewProperties.length}`);
+
+    return true;
 }
 
-// Run
-main().catch(console.error);
+// Run with proper error handling
+main()
+    .then((success) => {
+        console.log('Script finished successfully');
+        process.exit(0);
+    })
+    .catch((error) => {
+        console.error('Script failed with error:', error);
+        process.exit(1);
+    });
+

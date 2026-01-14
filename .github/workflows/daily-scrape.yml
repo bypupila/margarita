@@ -30,7 +30,7 @@ jobs:
         env:
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: node scripts/daily-scraper.js
+        run: node scripts/daily-scraper.cjs
       
       - name: Check for changes
         id: git-check
